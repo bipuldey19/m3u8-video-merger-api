@@ -6,328 +6,269 @@ import subprocess
 import os
 import uuid
 import shutil
+import logging
 from pathlib import Path
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import logging
+import time
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Video Merger API", version="1.0.0")
+app = FastAPI(title="Video Merger API")
 
-# Configuration
 TEMP_DIR = Path("/tmp/video_processing")
-OUTPUT_DIR = Path("/tmp/video_output")
-MAX_WORKERS = 3
-REELS_WIDTH = 1080
-REELS_HEIGHT = 1920
-
+OUTPUT_DIR = Path("/tmp/output")
 TEMP_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+executor = ThreadPoolExecutor(max_workers=3)
+
 class RedditVideo(BaseModel):
-    hls_url: HttpUrl
-
-class SecureMedia(BaseModel):
-    reddit_video: RedditVideo
-
-class VideoInput(BaseModel):
     title: str
     author_fullname: Optional[str] = None
-    secure_media: SecureMedia
+    secure_media: dict
     url: HttpUrl
 
 class VideoRequest(BaseModel):
-    videos: List[VideoInput]
+    videos: List[RedditVideo]
 
-class VideoResponse(BaseModel):
-    status: str
-    message: str
-    output_file: Optional[str] = None
-    video_count: int
-
-executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-
-def cleanup_files(job_id: str):
-    """Clean up temporary files after processing"""
+def download_m3u8(url: str, output_path: str, timeout: int = 300) -> bool:
+    """Download m3u8 video using yt-dlp with robust settings"""
     try:
-        job_dir = TEMP_DIR / job_id
-        if job_dir.exists():
-            shutil.rmtree(job_dir)
-        logger.info(f"Cleaned up files for job {job_id}")
-    except Exception as e:
-        logger.error(f"Error cleaning up files: {e}")
-
-def download_video(url: str, output_path: Path) -> bool:
-    """Download M3U8 video using yt-dlp"""
-    try:
+        # Clean URL - remove query parameters
+        if "?" in url:
+            url = url.split("?")[0]
+        
         cmd = [
             "yt-dlp",
-            "-f", "best",
-            "--no-warnings",
             "--no-check-certificate",
-            "-o", str(output_path),
-            str(url)
+            "--no-warnings",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "--add-header", "Referer: https://www.reddit.com/",
+            "--hls-prefer-native",
+            "--concurrent-fragments", "5",
+            "--retries", "10",
+            "--fragment-retries", "10",
+            "--retry-sleep", "2",
+            "--socket-timeout", "60",
+            "--no-check-formats",
+            "--format", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "-o", output_path,
+            url
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        logger.info(f"Downloading: {url}")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
         
-        if result.returncode == 0 and output_path.exists():
-            logger.info(f"Successfully downloaded: {output_path}")
+        if result.returncode == 0 and os.path.exists(output_path):
+            size = os.path.getsize(output_path)
+            logger.info(f"Downloaded successfully: {output_path} ({size} bytes)")
             return True
         else:
             logger.error(f"Download failed: {result.stderr}")
             return False
+            
+    except subprocess.TimeoutExpired:
+        logger.error(f"Download timeout for {url}")
+        return False
     except Exception as e:
-        logger.error(f"Error downloading video: {e}")
+        logger.error(f"Download error: {str(e)}")
         return False
 
-def create_overlay_filter(index: int, total: int, title: str, duration: float, offset: float) -> str:
-    """Create FFmpeg filter for text overlay with reels-style design"""
-    # Escape special characters in title
-    title_escaped = title.replace("'", "'\\\\\\''").replace(":", "\\:")
-    
-    # Counter overlay (top right)
-    counter_filter = (
-        f"drawtext=text='{index}/{total}':"
-        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-        f"fontsize=60:fontcolor=white:"
-        f"x=w-tw-40:y=40:"
-        f"box=1:boxcolor=black@0.6:boxborderw=10:"
-        f"enable='between(t,{offset},{offset+duration})'"
-    )
-    
-    # Title overlay (bottom, centered)
-    title_filter = (
-        f"drawtext=text='{title_escaped}':"
-        f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-        f"fontsize=48:fontcolor=white:"
-        f"x=(w-text_w)/2:y=h-150:"
-        f"box=1:boxcolor=black@0.7:boxborderw=15:"
-        f"enable='between(t,{offset},{offset+duration})'"
-    )
-    
-    return f"{counter_filter},{title_filter}"
-
-def get_video_duration(video_path: Path) -> float:
-    """Get video duration using ffprobe"""
+def create_overlay_video(input_path: str, output_path: str, title: str, video_num: int, total: int) -> bool:
+    """Add title overlay and convert to reels format (1080x1920)"""
     try:
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(video_path)
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        return float(result.stdout.strip())
-    except Exception as e:
-        logger.error(f"Error getting duration: {e}")
-        return 0.0
-
-def process_single_video(video_path: Path, output_path: Path) -> bool:
-    """Scale and pad video to reels size"""
-    try:
+        # Escape special characters in title - more thorough escaping
+        safe_title = title.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
+        
+        # Create filter for reels format with overlay
+        filter_complex = (
+            f"[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
+            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+            f"drawtext=text='{video_num}/{total}':"
+            f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"fontsize=48:fontcolor=white:bordercolor=black:borderw=3:"
+            f"x=50:y=50,"
+            f"drawtext=text='{safe_title}':"
+            f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"fontsize=40:fontcolor=white:bordercolor=black:borderw=3:"
+            f"x=(w-text_w)/2:y=h-100[v]"
+        )
+        
         cmd = [
             "ffmpeg",
-            "-i", str(video_path),
-            "-vf", f"scale={REELS_WIDTH}:{REELS_HEIGHT}:force_original_aspect_ratio=decrease,pad={REELS_WIDTH}:{REELS_HEIGHT}:(ow-iw)/2:(oh-ih)/2:black",
+            "-i", input_path,
+            "-filter_complex", filter_complex,
+            "-map", "[v]",
+            "-map", "0:a?",
             "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",
+            "-preset", "veryfast",
+            "-crf", "26",
             "-c:a", "aac",
             "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-threads", "2",
             "-y",
-            str(output_path)
+            output_path
         ]
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
-        if result.returncode == 0:
-            logger.info(f"Processed video: {output_path}")
+        if result.returncode == 0 and os.path.exists(output_path):
+            logger.info(f"Overlay created: {output_path}")
             return True
         else:
-            logger.error(f"Processing failed: {result.stderr}")
+            logger.error(f"Overlay failed: {result.stderr}")
             return False
+            
     except Exception as e:
-        logger.error(f"Error processing video: {e}")
+        logger.error(f"Overlay error: {str(e)}")
         return False
 
-def merge_videos_with_overlays(video_files: List[Path], titles: List[str], output_path: Path) -> bool:
-    """Merge videos with text overlays"""
+def merge_videos(input_files: List[str], output_path: str) -> bool:
+    """Merge multiple videos using ffmpeg concat"""
     try:
-        # Get durations and create concat file
-        concat_file = output_path.parent / f"concat_{uuid.uuid4().hex}.txt"
-        processed_files = []
+        concat_file = output_path + ".txt"
         
-        # Process each video to reels size
-        for i, video_file in enumerate(video_files):
-            processed_file = video_file.parent / f"processed_{i}_{video_file.name}"
-            if process_single_video(video_file, processed_file):
-                processed_files.append(processed_file)
-            else:
-                logger.error(f"Failed to process video {i}")
-                return False
-        
-        # Create concat file
         with open(concat_file, 'w') as f:
-            for pf in processed_files:
-                f.write(f"file '{pf}'\n")
+            for file in input_files:
+                f.write(f"file '{file}'\n")
         
-        # Concatenate videos
-        temp_concat = output_path.parent / f"temp_concat_{uuid.uuid4().hex}.mp4"
-        concat_cmd = [
+        cmd = [
             "ffmpeg",
             "-f", "concat",
             "-safe", "0",
-            "-i", str(concat_file),
+            "-i", concat_file,
             "-c", "copy",
+            "-movflags", "+faststart",
             "-y",
-            str(temp_concat)
+            output_path
         ]
         
-        subprocess.run(concat_cmd, capture_output=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
-        # Add overlays
-        durations = [get_video_duration(pf) for pf in processed_files]
-        overlay_filters = []
-        offset = 0.0
+        os.remove(concat_file)
         
-        for i, (duration, title) in enumerate(zip(durations, titles), 1):
-            overlay_filters.append(create_overlay_filter(i, len(titles), title, duration, offset))
-            offset += duration
-        
-        filter_complex = ",".join(overlay_filters)
-        
-        final_cmd = [
-            "ffmpeg",
-            "-i", str(temp_concat),
-            "-vf", filter_complex,
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-c:a", "copy",
-            "-y",
-            str(output_path)
-        ]
-        
-        result = subprocess.run(final_cmd, capture_output=True, text=True, timeout=900)
-        
-        # Cleanup
-        concat_file.unlink(missing_ok=True)
-        temp_concat.unlink(missing_ok=True)
-        for pf in processed_files:
-            pf.unlink(missing_ok=True)
-        
-        if result.returncode == 0:
-            logger.info(f"Successfully merged videos: {output_path}")
+        if result.returncode == 0 and os.path.exists(output_path):
+            logger.info(f"Videos merged: {output_path}")
             return True
         else:
             logger.error(f"Merge failed: {result.stderr}")
             return False
             
     except Exception as e:
-        logger.error(f"Error merging videos: {e}")
+        logger.error(f"Merge error: {str(e)}")
         return False
 
-async def process_videos(job_id: str, videos: List[VideoInput]) -> dict:
-    """Main processing function"""
-    job_dir = TEMP_DIR / job_id
-    job_dir.mkdir(exist_ok=True)
-    
+def cleanup_directory(directory: Path, max_age_hours: int = 2):
+    """Clean up old files"""
     try:
-        # Download videos
-        downloaded_files = []
-        titles = []
-        
-        loop = asyncio.get_event_loop()
-        
-        for i, video in enumerate(videos):
-            output_file = job_dir / f"video_{i}.mp4"
-            url = str(video.secure_media.reddit_video.hls_url)
-            
-            # Download in thread pool
-            success = await loop.run_in_executor(
-                executor,
-                download_video,
-                url,
-                output_file
-            )
-            
-            if success:
-                downloaded_files.append(output_file)
-                titles.append(video.title)
-            else:
-                logger.warning(f"Failed to download video {i}: {video.title}")
-        
-        if not downloaded_files:
-            raise Exception("No videos were downloaded successfully")
-        
-        # Merge videos
-        output_file = OUTPUT_DIR / f"{job_id}.mp4"
-        success = await loop.run_in_executor(
-            executor,
-            merge_videos_with_overlays,
-            downloaded_files,
-            titles,
-            output_file
-        )
-        
-        if success:
-            return {
-                "status": "success",
-                "message": "Videos merged successfully",
-                "output_file": f"{job_id}.mp4",
-                "video_count": len(downloaded_files)
-            }
-        else:
-            raise Exception("Failed to merge videos")
-            
+        current_time = time.time()
+        for item in directory.iterdir():
+            if item.is_file():
+                if current_time - item.stat().st_mtime > max_age_hours * 3600:
+                    item.unlink()
+                    logger.info(f"Cleaned up: {item}")
     except Exception as e:
-        logger.error(f"Processing error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Cleanup temporary files
-        cleanup_files(job_id)
+        logger.error(f"Cleanup error: {str(e)}")
 
-@app.post("/merge", response_model=VideoResponse)
-async def merge_videos(request: VideoRequest, background_tasks: BackgroundTasks):
-    """
-    Merge multiple M3U8 videos into a single reels-format video with overlays
-    """
+@app.post("/merge-videos")
+async def merge_videos_endpoint(request: VideoRequest, background_tasks: BackgroundTasks):
+    """Main endpoint to merge Reddit videos"""
+    
     if not request.videos:
         raise HTTPException(status_code=400, detail="No videos provided")
     
     if len(request.videos) > 15:
         raise HTTPException(status_code=400, detail="Maximum 15 videos allowed")
     
-    job_id = uuid.uuid4().hex
+    job_id = str(uuid.uuid4())
+    job_dir = TEMP_DIR / job_id
+    job_dir.mkdir(exist_ok=True)
     
     try:
-        result = await process_videos(job_id, request.videos)
-        return VideoResponse(**result)
+        total_videos = len(request.videos)
+        processed_files = []
+        
+        # Download and process videos
+        for idx, video in enumerate(request.videos, 1):
+            try:
+                # Extract HLS URL
+                hls_url = video.secure_media.get("reddit_video", {}).get("hls_url")
+                if not hls_url:
+                    logger.warning(f"No HLS URL for video {idx}")
+                    continue
+                
+                # Download video
+                raw_file = str(job_dir / f"raw_{idx}.mp4")
+                if not download_m3u8(hls_url, raw_file):
+                    logger.warning(f"Failed to download video {idx}")
+                    continue
+                
+                # Add overlay
+                processed_file = str(job_dir / f"processed_{idx}.mp4")
+                if not create_overlay_video(raw_file, processed_file, video.title, idx, total_videos):
+                    logger.warning(f"Failed to process video {idx}")
+                    continue
+                
+                processed_files.append(processed_file)
+                
+                # Clean up raw file
+                os.remove(raw_file)
+                
+            except Exception as e:
+                logger.error(f"Error processing video {idx}: {str(e)}")
+                continue
+        
+        if not processed_files:
+            raise HTTPException(status_code=500, detail="No videos could be processed")
+        
+        # Merge all processed videos
+        output_file = OUTPUT_DIR / f"{job_id}_merged.mp4"
+        if not merge_videos(processed_files, str(output_file)):
+            raise HTTPException(status_code=500, detail="Failed to merge videos")
+        
+        # Cleanup job directory
+        shutil.rmtree(job_dir, ignore_errors=True)
+        
+        # Schedule cleanup of output file after 1 hour
+        background_tasks.add_task(cleanup_directory, OUTPUT_DIR, 1)
+        
+        return {
+            "success": True,
+            "job_id": job_id,
+            "processed_videos": len(processed_files),
+            "total_videos": total_videos,
+            "download_url": f"/download/{job_id}"
+        }
+        
+    except HTTPException:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
     except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/download/{filename}")
-async def download_video(filename: str, background_tasks: BackgroundTasks):
-    """
-    Download the merged video file
-    """
-    file_path = OUTPUT_DIR / filename
+@app.get("/download/{job_id}")
+async def download_video(job_id: str):
+    """Download the merged video"""
+    output_file = OUTPUT_DIR / f"{job_id}_merged.mp4"
     
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # Schedule cleanup after 1 hour
-    background_tasks.add_task(lambda: asyncio.sleep(3600) or file_path.unlink(missing_ok=True))
+    if not output_file.exists():
+        raise HTTPException(status_code=404, detail="Video not found")
     
     return FileResponse(
-        path=file_path,
+        path=str(output_file),
         media_type="video/mp4",
-        filename=filename
+        filename=f"merged_reels_{job_id}.mp4"
     )
 
 @app.get("/health")
@@ -335,15 +276,12 @@ async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
 
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Video Merger API",
-        "version": "1.0.0",
-        "endpoints": {
-            "POST /merge": "Merge videos",
-            "GET /download/{filename}": "Download merged video",
-            "GET /health": "Health check"
-        }
-    }
+@app.on_event("startup")
+async def startup_event():
+    """Cleanup old files on startup"""
+    cleanup_directory(TEMP_DIR, 2)
+    cleanup_directory(OUTPUT_DIR, 2)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
