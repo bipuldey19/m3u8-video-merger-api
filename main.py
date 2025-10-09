@@ -82,35 +82,16 @@ def download_m3u8(url: str, output_path: str, timeout: int = 300) -> bool:
         logger.error(f"Download error: {str(e)}")
         return False
 
-def create_overlay_video(input_path: str, output_path: str, title: str, video_num: int, total: int) -> bool:
-    """Add title overlay and convert to reels format (1080x1920)"""
+def normalize_video(input_path: str, output_path: str) -> bool:
+    """Normalize video to reels format (1080x1920) without overlay"""
     try:
-        # Escape special characters in title - more thorough escaping
-        safe_title = title.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:").replace("%", "\\%")
-        
-        # Create filter for reels format with overlay
-        filter_complex = (
-            f"[0:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
-            f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
-            f"drawtext=text='{video_num}/{total}':"
-            f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"fontsize=48:fontcolor=white:bordercolor=black:borderw=3:"
-            f"x=50:y=50,"
-            f"drawtext=text='{safe_title}':"
-            f"fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"fontsize=40:fontcolor=white:bordercolor=black:borderw=3:"
-            f"x=(w-text_w)/2:y=h-100[v]"
-        )
-        
         cmd = [
             "ffmpeg",
             "-i", input_path,
-            "-filter_complex", filter_complex,
-            "-map", "[v]",
-            "-map", "0:a?",
+            "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black",
             "-c:v", "libx264",
             "-preset", "veryfast",
-            "-crf", "26",
+            "-crf", "23",
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
@@ -122,18 +103,84 @@ def create_overlay_video(input_path: str, output_path: str, title: str, video_nu
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         
         if result.returncode == 0 and os.path.exists(output_path):
-            logger.info(f"Overlay created: {output_path}")
+            logger.info(f"Video normalized: {output_path}")
             return True
         else:
-            logger.error(f"Overlay failed: {result.stderr}")
+            logger.error(f"Normalization failed: {result.stderr}")
             return False
             
     except Exception as e:
-        logger.error(f"Overlay error: {str(e)}")
+        logger.error(f"Normalization error: {str(e)}")
         return False
 
-def merge_videos(input_files: List[str], output_path: str) -> bool:
-    """Merge multiple videos using ffmpeg concat"""
+def merge_videos_with_transitions(input_files: List[str], output_path: str, transition_duration: float = 0.5) -> bool:
+    """Merge multiple videos with smooth crossfade transitions"""
+    try:
+        if len(input_files) == 1:
+            # If only one video, just copy it
+            shutil.copy(input_files[0], output_path)
+            return True
+        
+        # Build complex filter for crossfade transitions
+        filter_parts = []
+        
+        # Load all video inputs
+        for i in range(len(input_files)):
+            filter_parts.append(f"[{i}:v]")
+        
+        # Create crossfade chain
+        current_label = "[v0]"
+        for i in range(len(input_files) - 1):
+            if i == 0:
+                filter_parts.append(f"[0:v][1:v]xfade=transition=fade:duration={transition_duration}:offset=0[v{i+1}];")
+            else:
+                filter_parts.append(f"[v{i}][{i+1}:v]xfade=transition=fade:duration={transition_duration}:offset=0[v{i+1}];")
+            current_label = f"[v{i+1}]"
+        
+        # Audio mixing
+        audio_parts = []
+        for i in range(len(input_files)):
+            audio_parts.append(f"[{i}:a]")
+        audio_parts.append(f"concat=n={len(input_files)}:v=0:a=1[a]")
+        
+        filter_complex = "".join(filter_parts) + "".join(audio_parts)
+        
+        # Build ffmpeg command
+        cmd = ["ffmpeg"]
+        for file in input_files:
+            cmd.extend(["-i", file])
+        
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", current_label,
+            "-map", "[a]",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            "-y",
+            output_path
+        ])
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        
+        if result.returncode == 0 and os.path.exists(output_path):
+            logger.info(f"Videos merged with transitions: {output_path}")
+            return True
+        else:
+            logger.error(f"Merge failed: {result.stderr}")
+            # Fallback to simple concat if xfade fails
+            return merge_videos_simple(input_files, output_path)
+            
+    except Exception as e:
+        logger.error(f"Merge error: {str(e)}")
+        # Fallback to simple concat
+        return merge_videos_simple(input_files, output_path)
+
+def merge_videos_simple(input_files: List[str], output_path: str) -> bool:
+    """Simple concat merge as fallback"""
     try:
         concat_file = output_path + ".txt"
         
@@ -157,14 +204,14 @@ def merge_videos(input_files: List[str], output_path: str) -> bool:
         os.remove(concat_file)
         
         if result.returncode == 0 and os.path.exists(output_path):
-            logger.info(f"Videos merged: {output_path}")
+            logger.info(f"Videos merged (simple): {output_path}")
             return True
         else:
-            logger.error(f"Merge failed: {result.stderr}")
+            logger.error(f"Simple merge failed: {result.stderr}")
             return False
             
     except Exception as e:
-        logger.error(f"Merge error: {str(e)}")
+        logger.error(f"Simple merge error: {str(e)}")
         return False
 
 def cleanup_directory(directory: Path, max_age_hours: int = 2):
@@ -212,9 +259,9 @@ async def merge_videos_endpoint(request: VideoRequest, background_tasks: Backgro
                     logger.warning(f"Failed to download video {idx}")
                     continue
                 
-                # Add overlay
+                # Normalize to reels format
                 processed_file = str(job_dir / f"processed_{idx}.mp4")
-                if not create_overlay_video(raw_file, processed_file, video.title, idx, total_videos):
+                if not normalize_video(raw_file, processed_file):
                     logger.warning(f"Failed to process video {idx}")
                     continue
                 
@@ -230,16 +277,16 @@ async def merge_videos_endpoint(request: VideoRequest, background_tasks: Backgro
         if not processed_files:
             raise HTTPException(status_code=500, detail="No videos could be processed")
         
-        # Merge all processed videos
+        # Merge all processed videos with transitions
         output_file = OUTPUT_DIR / f"{job_id}_merged.mp4"
-        if not merge_videos(processed_files, str(output_file)):
+        if not merge_videos_with_transitions(processed_files, str(output_file)):
             raise HTTPException(status_code=500, detail="Failed to merge videos")
         
         # Cleanup job directory
         shutil.rmtree(job_dir, ignore_errors=True)
         
-        # Schedule cleanup of output file after 1 hour
-        background_tasks.add_task(cleanup_directory, OUTPUT_DIR, 1)
+        # Schedule cleanup of output file after 48 hours
+        background_tasks.add_task(cleanup_directory, OUTPUT_DIR, 48)
         
         return {
             "success": True,
@@ -279,8 +326,8 @@ async def health_check():
 @app.on_event("startup")
 async def startup_event():
     """Cleanup old files on startup"""
-    cleanup_directory(TEMP_DIR, 2)
-    cleanup_directory(OUTPUT_DIR, 2)
+    cleanup_directory(TEMP_DIR, 48)
+    cleanup_directory(OUTPUT_DIR, 48)
 
 if __name__ == "__main__":
     import uvicorn
